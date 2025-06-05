@@ -4,53 +4,50 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 )
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Println("Usage: go run main.go <datalogger-ip> <your-local-ip>")
-		fmt.Println("Example: go run main.go 192.168.88.88 192.168.88.92")
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: go run main.go <datalogger-ip>")
 		os.Exit(1)
 	}
 
 	dataloggerIP := os.Args[1]
-	localIP := os.Args[2]
 
-	// Step 1: Create TCP listener
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:8899", localIP))
-	if err != nil {
-		fmt.Printf("Failed to create listener: %v\n", err)
-		os.Exit(1)
-	}
-	defer listener.Close()
-	fmt.Printf("Listening on %s:8899\n", localIP)
-
-	// Step 2: Send UDP command to datalogger
+	// Connect via UDP to port 58899
 	udpAddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:58899", dataloggerIP))
-	udpConn, err := net.DialUDP("udp", nil, udpAddr)
+	conn, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
-		fmt.Printf("Failed to connect UDP: %v\n", err)
-		os.Exit(1)
-	}
-
-	command := fmt.Sprintf("set>server=%s:8899;", localIP)
-	udpConn.Write([]byte(command))
-	udpConn.Close()
-
-	fmt.Printf("Sent command: %s\n", command)
-	fmt.Println("Waiting for datalogger to connect...")
-
-	// Step 3: Accept connection
-	conn, err := listener.Accept()
-	if err != nil {
-		fmt.Printf("Failed to accept connection: %v\n", err)
+		fmt.Printf("Failed to connect: %v\n", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
 
-	fmt.Printf("✓ Datalogger connected from: %s\n", conn.RemoteAddr())
+	fmt.Println("Connected to datalogger via UDP")
 
-	// Keep connection open
-	fmt.Println("\nPress Enter to close...")
-	fmt.Scanln()
+	// Try different query commands
+	commands := []string{
+		"query",
+		"status",
+		"info",
+		"get>data;",
+		"{\"cmd\":\"status\"}",
+	}
+
+	for _, cmd := range commands {
+		fmt.Printf("\nSending: %s\n", cmd)
+		conn.Write([]byte(cmd))
+
+		// Read response
+		buffer := make([]byte, 1024)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _, err := conn.ReadFromUDP(buffer)
+
+		if err == nil && n > 0 {
+			fmt.Printf("Response: %s\n", string(buffer[:n]))
+		} else {
+			fmt.Println("No response")
+		}
+	}
 }
