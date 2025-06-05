@@ -304,7 +304,7 @@ func (dlc *DataLoggerConnection) Close() error {
 
 func main() {
 	// Create UDP connection to datalogger
-	logger := NewDataLoggerConnection("udp", "192.168.4.1", "9999")
+	logger := NewDataLoggerConnection("udp", "192.168.88.81", "9999")
 
 	// Connect
 	if err := logger.Connect(); err != nil {
