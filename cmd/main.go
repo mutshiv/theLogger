@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -65,11 +67,10 @@ func getLocalIP(dataloggerIP string) (string, error) {
 		for _, addr := range addrs {
 			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
 				ip := ipnet.IP.String()
-				fmt.Printf("Found interface %s with IP: %s\n", iface.Name, ip)
 
 				// Check if this IP is in the same subnet as the datalogger
 				if strings.HasPrefix(ip, networkPrefix+".") {
-					fmt.Printf("✓ Found matching IP: %s\n", ip)
+					fmt.Printf("✓ Found matching IP: %s (interface: %s)\n", ip, iface.Name)
 					return ip, nil
 				}
 			}
@@ -319,6 +320,39 @@ func (dlc *DataLoggerConnection) Close() error {
 	return nil
 }
 
+// tryAlternativeCommands tests different protocol variations
+func (dlc *DataLoggerConnection) tryAlternativeCommands() {
+	fmt.Println("\nTrying alternative commands...")
+
+	// Try different hex commands that might work
+	commands := map[string]string{
+		"Alt Magic 1":  "aaaa000100030011",
+		"Alt Magic 2":  "0103000000010000",
+		"Status Query": "010300000001840a",
+		"Read All":     "0104000000010000",
+	}
+
+	for name, hexCmd := range commands {
+		cmd, _ := hex.DecodeString(hexCmd)
+		fmt.Printf("\nTrying %s: %x\n", name, cmd)
+
+		dlc.mu.Lock()
+		dlc.tcpConn.Write(cmd)
+
+		buffer := make([]byte, 1024)
+		dlc.tcpConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := dlc.tcpConn.Read(buffer)
+		dlc.mu.Unlock()
+
+		if err == nil && n > 0 {
+			fmt.Printf("Response (%d bytes): %x\n", n, buffer[:n])
+			if n > 20 {
+				fmt.Println("This looks like valid data!")
+			}
+		}
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -326,40 +360,153 @@ func min(a, b int) int {
 	return b
 }
 
-func main() {
-	// First, let's check what network interfaces and IPs are available
-	fmt.Println("=== Network Interfaces ===")
-	interfaces, _ := net.Interfaces()
+func printUsage() {
+	fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS] <datalogger-ip>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "\nOptions:\n")
+	flag.PrintDefaults()
+	fmt.Fprintf(os.Stderr, "\nExample:\n")
+	fmt.Fprintf(os.Stderr, "  %s 192.168.88.88\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  %s -discover\n", os.Args[0])
+}
+
+// discoverDatalogger attempts to find the datalogger on the network
+func discoverDatalogger() (string, error) {
+	fmt.Println("Discovering datalogger on the network...")
+
+	// Get all network interfaces
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+
+	// Look for IPs in common ranges
+	commonRanges := []string{"192.168.88", "192.168.4", "192.168.1", "10.10.10"}
+
 	for _, iface := range interfaces {
-		if iface.Flags&net.FlagUp != 0 {
-			addrs, _ := iface.Addrs()
-			for _, addr := range addrs {
-				fmt.Printf("%s: %v\n", iface.Name, addr)
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				ip := ipnet.IP.String()
+
+				// Check if we're in a common range
+				for _, prefix := range commonRanges {
+					if strings.HasPrefix(ip, prefix+".") {
+						// Try common gateway IPs
+						candidates := []string{
+							prefix + ".1",
+							prefix + ".88",
+							prefix + ".254",
+						}
+
+						fmt.Printf("Found local IP %s, checking potential dataloggers...\n", ip)
+
+						for _, candidate := range candidates {
+							fmt.Printf("Trying %s... ", candidate)
+
+							// Try to connect to UDP port 58899
+							udpAddr, _ := net.ResolveUDPAddr("udp", candidate+":58899")
+							conn, err := net.DialUDP("udp", nil, udpAddr)
+							if err != nil {
+								fmt.Println("Failed")
+								continue
+							}
+
+							// Send a simple query
+							conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+							_, err = conn.Write([]byte("query"))
+							if err != nil {
+								conn.Close()
+								fmt.Println("Failed")
+								continue
+							}
+
+							// Wait for any response
+							buffer := make([]byte, 1024)
+							conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+							_, _, err = conn.ReadFromUDP(buffer)
+							conn.Close()
+
+							if err == nil {
+								fmt.Println("✓ Found!")
+								return candidate, nil
+							}
+							fmt.Println("No response")
+						}
+					}
+				}
 			}
 		}
 	}
-	fmt.Println("========================\n")
 
-	// Assuming datalogger is at 192.168.88.1 (common for AP mode)
-	// Adjust this to your actual datalogger IP
-	dataloggerIP := "192.168.88.1"
+	return "", fmt.Errorf("no datalogger found on the network")
+}
 
-	// Create connection
+func main() {
+	// Define command-line flags
+	var discover bool
+	flag.BoolVar(&discover, "discover", false, "Attempt to discover datalogger IP automatically")
+	flag.Usage = printUsage
+	flag.Parse()
+
+	var dataloggerIP string
+
+	if discover {
+		// Try to discover the datalogger
+		ip, err := discoverDatalogger()
+		if err != nil {
+			fmt.Printf("Failed to discover datalogger: %v\n", err)
+			fmt.Println("\nPlease specify the datalogger IP manually")
+			os.Exit(1)
+		}
+		dataloggerIP = ip
+		fmt.Printf("\nDiscovered datalogger at: %s\n", dataloggerIP)
+	} else {
+		// Check if IP address was provided
+		if flag.NArg() < 1 {
+			printUsage()
+			os.Exit(1)
+		}
+		dataloggerIP = flag.Arg(0)
+
+		// Validate IP format
+		if net.ParseIP(dataloggerIP) == nil {
+			fmt.Fprintf(os.Stderr, "Error: Invalid IP address format: %s\n", dataloggerIP)
+			os.Exit(1)
+		}
+	}
+
+	fmt.Println("=== SmartESS Datalogger Connection ===")
+	fmt.Printf("Datalogger IP: %s\n", dataloggerIP)
+	fmt.Println("=====================================\n")
+
+	// Create connection to datalogger
 	dlc, err := NewDataLoggerConnection(dataloggerIP)
 	if err != nil {
 		fmt.Printf("Failed to create connection: %v\n", err)
-		fmt.Println("\nPlease ensure you're connected to the datalogger's WiFi network")
-		fmt.Println("Your IP should be in the 192.168.88.x range")
-		return
+		fmt.Println("\nMake sure you're connected to the datalogger's WiFi network")
+		os.Exit(1)
 	}
 	defer dlc.Close()
 
-	fmt.Println("\nConnecting to datalogger...")
+	fmt.Println("Connecting to datalogger...")
 
 	// Connect
 	if err := dlc.Connect(); err != nil {
 		fmt.Printf("Failed to connect: %v\n", err)
-		return
+		fmt.Println("\nTroubleshooting:")
+		fmt.Println("1. Make sure no firewall is blocking port 8899")
+		fmt.Println("2. Ensure the SmartESS app is not connected")
+		fmt.Println("3. Try power cycling the datalogger")
+		fmt.Println("4. Verify the IP address is correct")
+		os.Exit(1)
 	}
 
 	fmt.Println("Connected! Querying data...")
@@ -368,6 +515,11 @@ func main() {
 	data, err := dlc.QueryAllData()
 	if err != nil {
 		fmt.Printf("Failed to query data: %v\n", err)
+		fmt.Println("\nThe datalogger connected but may use a different protocol.")
+		fmt.Println("Trying alternative methods...")
+
+		// Try some alternative commands
+		dlc.tryAlternativeCommands()
 	} else {
 		fmt.Println("\n=== Inverter Data ===")
 		for key, value := range data {
@@ -378,7 +530,7 @@ func main() {
 	// Get PV power specifically
 	pvPower, err := dlc.GetPVPower()
 	if err != nil {
-		fmt.Printf("Failed to get PV power: %v\n", err)
+		fmt.Printf("\nFailed to get PV power: %v\n", err)
 	} else {
 		fmt.Printf("\nCurrent PV Power: %.1f W\n", pvPower)
 	}
