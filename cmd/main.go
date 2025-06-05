@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,7 +24,7 @@ type DataLoggerConnection struct {
 // NewDataLoggerConnection creates a new connection handler
 func NewDataLoggerConnection(dataloggerIP string) (*DataLoggerConnection, error) {
 	// Get local IP address on the same network as the datalogger
-	localIP, err := getLocalIP()
+	localIP, err := getLocalIP(dataloggerIP)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get local IP: %w", err)
 	}
@@ -35,13 +36,23 @@ func NewDataLoggerConnection(dataloggerIP string) (*DataLoggerConnection, error)
 }
 
 // getLocalIP returns the local IP address on the same subnet as the datalogger
-func getLocalIP() (string, error) {
+func getLocalIP(dataloggerIP string) (string, error) {
+	// Parse datalogger IP to get the network prefix
+	parts := strings.Split(dataloggerIP, ".")
+	if len(parts) != 4 {
+		return "", fmt.Errorf("invalid datalogger IP format")
+	}
+	networkPrefix := strings.Join(parts[:3], ".")
+
+	fmt.Printf("Looking for IP in network: %s.x\n", networkPrefix)
+
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		return "", err
 	}
 
 	for _, iface := range interfaces {
+		// Skip down interfaces
 		if iface.Flags&net.FlagUp == 0 {
 			continue
 		}
@@ -53,15 +64,19 @@ func getLocalIP() (string, error) {
 
 		for _, addr := range addrs {
 			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
-				// Check if it's in the 192.168.4.x range (datalogger network)
-				if ipnet.IP.String()[:10] == "192.168.4." {
-					return ipnet.IP.String(), nil
+				ip := ipnet.IP.String()
+				fmt.Printf("Found interface %s with IP: %s\n", iface.Name, ip)
+
+				// Check if this IP is in the same subnet as the datalogger
+				if strings.HasPrefix(ip, networkPrefix+".") {
+					fmt.Printf("✓ Found matching IP: %s\n", ip)
+					return ip, nil
 				}
 			}
 		}
 	}
 
-	return "", fmt.Errorf("no IP address found on datalogger network")
+	return "", fmt.Errorf("no IP address found in %s.x network", networkPrefix)
 }
 
 // Connect establishes connection with the datalogger
@@ -69,11 +84,15 @@ func (dlc *DataLoggerConnection) Connect() error {
 	dlc.mu.Lock()
 	defer dlc.mu.Unlock()
 
+	fmt.Printf("Using local IP: %s\n", dlc.localIP)
+	fmt.Printf("Datalogger IP: %s\n", dlc.dataloggerIP)
+
 	// Step 1: Create TCP listener on port 8899
 	listener, err := net.Listen("tcp", fmt.Sprintf("%s:8899", dlc.localIP))
 	if err != nil {
-		return fmt.Errorf("failed to create TCP listener: %w", err)
+		return fmt.Errorf("failed to create TCP listener on %s:8899: %w", dlc.localIP, err)
 	}
+	fmt.Printf("TCP listener created on %s:8899\n", dlc.localIP)
 	dlc.tcpListener = listener
 
 	// Step 2: Start goroutine to accept connection
@@ -105,14 +124,15 @@ func (dlc *DataLoggerConnection) Connect() error {
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	n, _, err := conn.ReadFromUDP(buffer)
 	if err != nil {
-		return fmt.Errorf("no UDP response: %w", err)
+		fmt.Printf("Warning: No UDP response (timeout). This might be normal.\n")
+	} else {
+		response := string(buffer[:n])
+		fmt.Printf("UDP Response: %s\n", response)
 	}
 
-	response := string(buffer[:n])
-	fmt.Printf("UDP Response: %s\n", response)
-
 	// Wait for TCP connection
-	time.Sleep(2 * time.Second)
+	fmt.Println("Waiting for datalogger to connect back...")
+	time.Sleep(3 * time.Second)
 
 	if dlc.tcpConn == nil {
 		return fmt.Errorf("datalogger didn't connect back on TCP")
@@ -123,6 +143,7 @@ func (dlc *DataLoggerConnection) Connect() error {
 
 // acceptConnection accepts incoming TCP connection from datalogger
 func (dlc *DataLoggerConnection) acceptConnection() {
+	fmt.Println("Waiting for incoming TCP connection...")
 	conn, err := dlc.tcpListener.Accept()
 	if err != nil {
 		fmt.Printf("Failed to accept connection: %v\n", err)
@@ -133,7 +154,7 @@ func (dlc *DataLoggerConnection) acceptConnection() {
 	dlc.tcpConn = conn
 	dlc.mu.Unlock()
 
-	fmt.Printf("Datalogger connected from: %s\n", conn.RemoteAddr())
+	fmt.Printf("✓ Datalogger connected from: %s\n", conn.RemoteAddr())
 }
 
 // QueryAllData sends the magic command to get all inverter data
@@ -170,9 +191,6 @@ func (dlc *DataLoggerConnection) QueryAllData() (map[string]interface{}, error) 
 func (dlc *DataLoggerConnection) parseAllDataResponse(data []byte) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 
-	// The response contains all SmartESS app data
-	// Based on reverse engineering, common fields include:
-
 	if len(data) < 100 {
 		return nil, fmt.Errorf("response too short: %d bytes", len(data))
 	}
@@ -181,8 +199,6 @@ func (dlc *DataLoggerConnection) parseAllDataResponse(data []byte) (map[string]i
 	offset := 9
 
 	// Parse various fields (positions may vary by model)
-	// These are common positions found in similar inverters
-
 	// PV Power (Watts) - typically at offset 33-34
 	if len(data) > offset+34 {
 		pvPower := binary.BigEndian.Uint16(data[offset+33 : offset+35])
@@ -311,16 +327,34 @@ func min(a, b int) int {
 }
 
 func main() {
-	// Create connection to datalogger
-	dlc, err := NewDataLoggerConnection("192.168.4.1")
+	// First, let's check what network interfaces and IPs are available
+	fmt.Println("=== Network Interfaces ===")
+	interfaces, _ := net.Interfaces()
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp != 0 {
+			addrs, _ := iface.Addrs()
+			for _, addr := range addrs {
+				fmt.Printf("%s: %v\n", iface.Name, addr)
+			}
+		}
+	}
+	fmt.Println("========================\n")
+
+	// Assuming datalogger is at 192.168.88.1 (common for AP mode)
+	// Adjust this to your actual datalogger IP
+	dataloggerIP := "192.168.88.1"
+
+	// Create connection
+	dlc, err := NewDataLoggerConnection(dataloggerIP)
 	if err != nil {
 		fmt.Printf("Failed to create connection: %v\n", err)
+		fmt.Println("\nPlease ensure you're connected to the datalogger's WiFi network")
+		fmt.Println("Your IP should be in the 192.168.88.x range")
 		return
 	}
 	defer dlc.Close()
 
-	fmt.Printf("Local IP: %s\n", dlc.localIP)
-	fmt.Println("Connecting to datalogger...")
+	fmt.Println("\nConnecting to datalogger...")
 
 	// Connect
 	if err := dlc.Connect(); err != nil {
