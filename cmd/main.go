@@ -1,347 +1,351 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"time"
 )
 
-// DataLoggerConnection handles UDP connection to the datalogger
+// DataLoggerConnection for SmartESS WiFi datalogger
 type DataLoggerConnection struct {
-	protocol     string
-	address      string
+	dataloggerIP string
+	localIP      string
 	udpConn      *net.UDPConn
-	udpAddr      *net.UDPAddr
-	readTimeout  time.Duration
-	writeTimeout time.Duration
+	tcpListener  net.Listener
+	tcpConn      net.Conn
 	mu           sync.Mutex
 }
 
 // NewDataLoggerConnection creates a new connection handler
-func NewDataLoggerConnection(protocol, ip, port string) *DataLoggerConnection {
-	return &DataLoggerConnection{
-		protocol:     protocol,
-		address:      fmt.Sprintf("%s:%s", ip, port),
-		readTimeout:  5 * time.Second,
-		writeTimeout: 5 * time.Second,
+func NewDataLoggerConnection(dataloggerIP string) (*DataLoggerConnection, error) {
+	// Get local IP address on the same network as the datalogger
+	localIP, err := getLocalIP()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get local IP: %w", err)
 	}
+
+	return &DataLoggerConnection{
+		dataloggerIP: dataloggerIP,
+		localIP:      localIP,
+	}, nil
 }
 
-// Connect establishes UDP connection
+// getLocalIP returns the local IP address on the same subnet as the datalogger
+func getLocalIP() (string, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				// Check if it's in the 192.168.4.x range (datalogger network)
+				if ipnet.IP.String()[:10] == "192.168.4." {
+					return ipnet.IP.String(), nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no IP address found on datalogger network")
+}
+
+// Connect establishes connection with the datalogger
 func (dlc *DataLoggerConnection) Connect() error {
 	dlc.mu.Lock()
 	defer dlc.mu.Unlock()
 
-	if dlc.protocol != "udp" {
-		return fmt.Errorf("unsupported protocol: %s", dlc.protocol)
+	// Step 1: Create TCP listener on port 8899
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:8899", dlc.localIP))
+	if err != nil {
+		return fmt.Errorf("failed to create TCP listener: %w", err)
 	}
+	dlc.tcpListener = listener
 
-	// Resolve UDP address
-	udpAddr, err := net.ResolveUDPAddr("udp", dlc.address)
+	// Step 2: Start goroutine to accept connection
+	go dlc.acceptConnection()
+
+	// Step 3: Send UDP command to datalogger
+	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:58899", dlc.dataloggerIP))
 	if err != nil {
 		return fmt.Errorf("failed to resolve UDP address: %w", err)
 	}
 
-	// Create UDP connection
 	conn, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
-		return fmt.Errorf("UDP connection failed: %w", err)
+		return fmt.Errorf("failed to create UDP connection: %w", err)
+	}
+	dlc.udpConn = conn
+
+	// Send command to make datalogger connect to us
+	command := fmt.Sprintf("set>server=%s:8899;", dlc.localIP)
+	_, err = conn.Write([]byte(command))
+	if err != nil {
+		return fmt.Errorf("failed to send UDP command: %w", err)
 	}
 
-	// Set buffer sizes
-	conn.SetReadBuffer(65536)
-	conn.SetWriteBuffer(65536)
+	fmt.Printf("Sent UDP command: %s\n", command)
 
-	dlc.udpConn = conn
-	dlc.udpAddr = udpAddr
+	// Wait for response
+	buffer := make([]byte, 1024)
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, _, err := conn.ReadFromUDP(buffer)
+	if err != nil {
+		return fmt.Errorf("no UDP response: %w", err)
+	}
+
+	response := string(buffer[:n])
+	fmt.Printf("UDP Response: %s\n", response)
+
+	// Wait for TCP connection
+	time.Sleep(2 * time.Second)
+
+	if dlc.tcpConn == nil {
+		return fmt.Errorf("datalogger didn't connect back on TCP")
+	}
 
 	return nil
 }
 
-// Write sends data to the datalogger
-func (dlc *DataLoggerConnection) Write(data []byte) (int, error) {
-	dlc.mu.Lock()
-	defer dlc.mu.Unlock()
-
-	if dlc.udpConn == nil {
-		return 0, fmt.Errorf("UDP connection not established")
-	}
-
-	dlc.udpConn.SetWriteDeadline(time.Now().Add(dlc.writeTimeout))
-	return dlc.udpConn.Write(data)
-}
-
-// Read reads data from the datalogger
-func (dlc *DataLoggerConnection) Read(buffer []byte) (int, error) {
-	dlc.mu.Lock()
-	defer dlc.mu.Unlock()
-
-	if dlc.udpConn == nil {
-		return 0, fmt.Errorf("UDP connection not established")
-	}
-
-	dlc.udpConn.SetReadDeadline(time.Now().Add(dlc.readTimeout))
-	return dlc.udpConn.Read(buffer)
-}
-
-// SendCommand sends a command and waits for response
-func (dlc *DataLoggerConnection) SendCommand(command string) (string, error) {
-	// Send command
-	_, err := dlc.Write([]byte(command))
+// acceptConnection accepts incoming TCP connection from datalogger
+func (dlc *DataLoggerConnection) acceptConnection() {
+	conn, err := dlc.tcpListener.Accept()
 	if err != nil {
-		return "", fmt.Errorf("failed to send command: %w", err)
+		fmt.Printf("Failed to accept connection: %v\n", err)
+		return
+	}
+
+	dlc.mu.Lock()
+	dlc.tcpConn = conn
+	dlc.mu.Unlock()
+
+	fmt.Printf("Datalogger connected from: %s\n", conn.RemoteAddr())
+}
+
+// QueryAllData sends the magic command to get all inverter data
+func (dlc *DataLoggerConnection) QueryAllData() (map[string]interface{}, error) {
+	dlc.mu.Lock()
+	defer dlc.mu.Unlock()
+
+	if dlc.tcpConn == nil {
+		return nil, fmt.Errorf("no TCP connection established")
+	}
+
+	// Magic command discovered by network sniffing
+	// HEX: aaaa00010003001100
+	magicCmd, _ := hex.DecodeString("aaaa00010003001100")
+
+	_, err := dlc.tcpConn.Write(magicCmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send command: %w", err)
 	}
 
 	// Read response
-	buffer := make([]byte, 4096) // Larger buffer for potentially long responses
-	n, err := dlc.Read(buffer)
+	buffer := make([]byte, 4096)
+	dlc.tcpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := dlc.tcpConn.Read(buffer)
 	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
+		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
-	return string(buffer[:n]), nil
+	// Parse response
+	return dlc.parseAllDataResponse(buffer[:n])
 }
 
-// DiscoverCommands tries various command formats to find valid ones
-func (dlc *DataLoggerConnection) DiscoverCommands() {
-	fmt.Println("=== Command Discovery ===")
-	fmt.Println("Trying various command formats...")
+// parseAllDataResponse parses the all-in-one data packet
+func (dlc *DataLoggerConnection) parseAllDataResponse(data []byte) (map[string]interface{}, error) {
+	result := make(map[string]interface{})
 
-	// Common command variations for PV/Solar systems
-	commands := []struct {
-		category string
-		cmds     []string
-	}{
-		{
-			"Basic Info Commands",
-			[]string{
-				"INFO", "STATUS", "GET STATUS", "DEVICE INFO",
-				"VERSION", "ID", "SERIAL", "MODEL",
-				"?", "HELP", "H", "LIST",
-			},
-		},
-		{
-			"PV Power Commands",
-			[]string{
-				"READ", "READ ALL", "READ_ALL", "READALL",
-				"GET DATA", "GET_DATA", "GETDATA",
-				"PV", "PV POWER", "PV_POWER", "PVPOWER",
-				"POWER", "P", "PWR", "W",
-				"READ PV", "READ_PV", "GET PV", "GET_PV",
-				"SOLAR", "SOLAR POWER", "GENERATION",
-			},
-		},
-		{
-			"Modbus-style Commands",
-			[]string{
-				"01 03 00 00 00 01", // Modbus read holding registers
-				"01 04 00 00 00 01", // Modbus read input registers
-				":010300000001FA",   // Modbus ASCII
-				"$01M",              // Some proprietary formats
-			},
-		},
-		{
-			"JSON Commands",
-			[]string{
-				`{"command":"read"}`,
-				`{"cmd":"get_data"}`,
-				`{"action":"read_pv"}`,
-				`{"get":"power"}`,
-			},
-		},
-		{
-			"XML Commands",
-			[]string{
-				"<request><command>read</command></request>",
-				"<get>power</get>",
-				"<?xml version='1.0'?><cmd>status</cmd>",
-			},
-		},
+	// The response contains all SmartESS app data
+	// Based on reverse engineering, common fields include:
+
+	if len(data) < 100 {
+		return nil, fmt.Errorf("response too short: %d bytes", len(data))
 	}
 
-	// Try each command
-	for _, group := range commands {
-		fmt.Printf("\n--- %s ---\n", group.category)
-		for _, cmd := range group.cmds {
-			fmt.Printf("Trying: %-30s -> ", cmd)
+	// Skip header bytes
+	offset := 9
 
-			response, err := dlc.SendCommand(cmd)
-			if err != nil {
-				// Check if it's a timeout (might mean no response expected)
-				if strings.Contains(err.Error(), "timeout") {
-					fmt.Println("No response (timeout)")
-				} else {
-					fmt.Printf("Error: %v\n", err)
-				}
-			} else {
-				// Got a response!
-				if len(response) > 50 {
-					fmt.Printf("Response: %.50s... (length: %d)\n", response, len(response))
-				} else {
-					fmt.Printf("Response: %s\n", response)
-				}
+	// Parse various fields (positions may vary by model)
+	// These are common positions found in similar inverters
 
-				// Try to identify if this looks like valid data
-				if looksLikeValidData(response) {
-					fmt.Printf("    ^^^ This looks like valid data! ^^^\n")
-				}
-			}
-
-			// Small delay between commands
-			time.Sleep(100 * time.Millisecond)
-		}
+	// PV Power (Watts) - typically at offset 33-34
+	if len(data) > offset+34 {
+		pvPower := binary.BigEndian.Uint16(data[offset+33 : offset+35])
+		result["pv_power_w"] = pvPower
 	}
+
+	// Battery Voltage - typically at offset 37-38
+	if len(data) > offset+38 {
+		batteryVoltage := float32(binary.BigEndian.Uint16(data[offset+37:offset+39])) / 10.0
+		result["battery_voltage"] = batteryVoltage
+	}
+
+	// Load Power - typically at offset 41-42
+	if len(data) > offset+42 {
+		loadPower := binary.BigEndian.Uint16(data[offset+41 : offset+43])
+		result["load_power_w"] = loadPower
+	}
+
+	// Grid Power - typically at offset 45-46
+	if len(data) > offset+46 {
+		gridPower := int16(binary.BigEndian.Uint16(data[offset+45 : offset+47]))
+		result["grid_power_w"] = gridPower
+	}
+
+	// Daily PV Generation - typically at offset 59-60
+	if len(data) > offset+60 {
+		dailyGeneration := float32(binary.BigEndian.Uint16(data[offset+59:offset+61])) / 10.0
+		result["daily_generation_kwh"] = dailyGeneration
+	}
+
+	// Debug: show hex dump of data
+	fmt.Printf("Raw data (first 100 bytes): %x\n", data[:min(100, len(data))])
+
+	return result, nil
 }
 
-// looksLikeValidData tries to identify if response contains valid data
-func looksLikeValidData(response string) bool {
-	// Check for common patterns in valid responses
-	checks := []func(string) bool{
-		// Contains numbers (likely measurements)
-		func(s string) bool {
-			for _, r := range s {
-				if r >= '0' && r <= '9' {
-					return true
-				}
-			}
-			return false
-		},
-		// JSON-like
-		func(s string) bool {
-			return strings.Contains(s, "{") && strings.Contains(s, "}")
-		},
-		// CSV-like
-		func(s string) bool {
-			return strings.Contains(s, ",") || strings.Contains(s, ";")
-		},
-		// Key-value pairs
-		func(s string) bool {
-			return strings.Contains(s, "=") || strings.Contains(s, ":")
-		},
-		// Not an error message
-		func(s string) bool {
-			lower := strings.ToLower(s)
-			return !strings.Contains(lower, "error") &&
-				!strings.Contains(lower, "invalid") &&
-				!strings.Contains(lower, "unknown")
-		},
+// QueryModbus sends standard Modbus TCP commands
+func (dlc *DataLoggerConnection) QueryModbus(slaveID byte, functionCode byte, address uint16, quantity uint16) ([]byte, error) {
+	dlc.mu.Lock()
+	defer dlc.mu.Unlock()
+
+	if dlc.tcpConn == nil {
+		return nil, fmt.Errorf("no TCP connection established")
 	}
 
-	validChecks := 0
-	for _, check := range checks {
-		if check(response) {
-			validChecks++
+	// Build Modbus TCP frame
+	transactionID := uint16(1)
+	protocolID := uint16(0)
+	length := uint16(6)
+
+	frame := new(bytes.Buffer)
+	binary.Write(frame, binary.BigEndian, transactionID)
+	binary.Write(frame, binary.BigEndian, protocolID)
+	binary.Write(frame, binary.BigEndian, length)
+	frame.WriteByte(slaveID)
+	frame.WriteByte(functionCode)
+	binary.Write(frame, binary.BigEndian, address)
+	binary.Write(frame, binary.BigEndian, quantity)
+
+	// Send command
+	_, err := dlc.tcpConn.Write(frame.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("failed to send Modbus command: %w", err)
+	}
+
+	// Read response
+	buffer := make([]byte, 256)
+	dlc.tcpConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err := dlc.tcpConn.Read(buffer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read Modbus response: %w", err)
+	}
+
+	return buffer[:n], nil
+}
+
+// GetPVPower tries different methods to get PV power
+func (dlc *DataLoggerConnection) GetPVPower() (float64, error) {
+	// Method 1: Try the all-data command
+	data, err := dlc.QueryAllData()
+	if err == nil {
+		if pvPower, ok := data["pv_power_w"].(uint16); ok {
+			return float64(pvPower), nil
 		}
 	}
 
-	return validChecks >= 2
-}
-
-// TryBinaryProtocol sends binary data patterns
-func (dlc *DataLoggerConnection) TryBinaryProtocol() {
-	fmt.Println("\n=== Trying Binary Protocols ===")
-
-	// Common binary protocols for solar/PV systems
-	binaryCommands := []struct {
-		name string
-		data []byte
-	}{
-		{"Modbus RTU Read", []byte{0x01, 0x03, 0x00, 0x00, 0x00, 0x01, 0x84, 0x0A}},
-		{"Simple Binary", []byte{0x01, 0x00}},
-		{"STX/ETX Protocol", []byte{0x02, 0x52, 0x03}}, // STX + 'R' + ETX
-		{"Binary with CRC", []byte{0xAA, 0x55, 0x01, 0x00, 0xFF}},
-	}
-
-	for _, cmd := range binaryCommands {
-		fmt.Printf("Trying %s: % X -> ", cmd.name, cmd.data)
-
-		_, err := dlc.Write(cmd.data)
-		if err != nil {
-			fmt.Printf("Write error: %v\n", err)
-			continue
-		}
-
-		buffer := make([]byte, 1024)
-		n, err := dlc.Read(buffer)
-		if err != nil {
-			fmt.Println("No response")
-		} else {
-			fmt.Printf("Response: % X (ASCII: %s)\n", buffer[:n], tryASCII(buffer[:n]))
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// tryASCII attempts to show ASCII representation of binary data
-func tryASCII(data []byte) string {
-	result := ""
-	for _, b := range data {
-		if b >= 32 && b <= 126 {
-			result += string(b)
-		} else {
-			result += "."
+	// Method 2: Try Modbus registers (common PV power registers)
+	// Register 0x0102 is common for PV power in many inverters
+	response, err := dlc.QueryModbus(1, 3, 0x0102, 1)
+	if err == nil && len(response) >= 9 {
+		// Skip Modbus TCP header (7 bytes) + function code (1 byte) + byte count (1 byte)
+		if len(response) >= 11 {
+			pvPower := binary.BigEndian.Uint16(response[9:11])
+			return float64(pvPower), nil
 		}
 	}
-	return result
+
+	return 0, fmt.Errorf("failed to get PV power")
 }
 
-// Close closes the connection
+// Close closes all connections
 func (dlc *DataLoggerConnection) Close() error {
 	dlc.mu.Lock()
 	defer dlc.mu.Unlock()
 
 	if dlc.udpConn != nil {
-		err := dlc.udpConn.Close()
-		dlc.udpConn = nil
-		return err
+		dlc.udpConn.Close()
+	}
+
+	if dlc.tcpConn != nil {
+		dlc.tcpConn.Close()
+	}
+
+	if dlc.tcpListener != nil {
+		dlc.tcpListener.Close()
 	}
 
 	return nil
 }
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func main() {
-	// Create UDP connection to datalogger
-	logger := NewDataLoggerConnection("udp", "192.168.88.81", "9999")
+	// Create connection to datalogger
+	dlc, err := NewDataLoggerConnection("192.168.4.1")
+	if err != nil {
+		fmt.Printf("Failed to create connection: %v\n", err)
+		return
+	}
+	defer dlc.Close()
+
+	fmt.Printf("Local IP: %s\n", dlc.localIP)
+	fmt.Println("Connecting to datalogger...")
 
 	// Connect
-	if err := logger.Connect(); err != nil {
+	if err := dlc.Connect(); err != nil {
 		fmt.Printf("Failed to connect: %v\n", err)
 		return
 	}
-	defer logger.Close()
 
-	fmt.Println("Connected to datalogger on UDP port 9999")
-	fmt.Println()
+	fmt.Println("Connected! Querying data...")
 
-	// Try to discover commands
-	logger.DiscoverCommands()
-
-	// Also try binary protocols
-	logger.TryBinaryProtocol()
-
-	// If you want to test a specific command
-	fmt.Println("\n=== Manual Command Test ===")
-	fmt.Println("Testing specific command for PV power...")
-
-	// Try some more specific PV commands
-	testCommands := []string{
-		"GET:POWER",
-		"READ:PV:POWER",
-		"QUERY:PV",
-		"*IDN?",      // SCPI standard
-		":MEAS:POW?", // SCPI measurement
-		"QPI",        // Some inverters use this
-		"QPGS0",      // Status query
+	// Get all data
+	data, err := dlc.QueryAllData()
+	if err != nil {
+		fmt.Printf("Failed to query data: %v\n", err)
+	} else {
+		fmt.Println("\n=== Inverter Data ===")
+		for key, value := range data {
+			fmt.Printf("%s: %v\n", key, value)
+		}
 	}
 
-	for _, cmd := range testCommands {
-		fmt.Printf("\nTrying: %s\n", cmd)
-		response, err := logger.SendCommand(cmd)
-		if err == nil {
-			fmt.Printf("Response: %s\n", response)
-		}
+	// Get PV power specifically
+	pvPower, err := dlc.GetPVPower()
+	if err != nil {
+		fmt.Printf("Failed to get PV power: %v\n", err)
+	} else {
+		fmt.Printf("\nCurrent PV Power: %.1f W\n", pvPower)
 	}
 }
